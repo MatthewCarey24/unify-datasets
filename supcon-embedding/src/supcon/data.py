@@ -35,13 +35,48 @@ def _find_mat(dataset_dir: str) -> str:
     return str(mats[0])
 
 
-def _find_metadata(dataset_dir: str) -> str:
-    """Find the *_sourceMetadata.csv file in a dataset directory."""
+def _build_group_to_treatment(dataset_dir: str) -> dict[int, str]:
+    """Build mapping from numericGroupId -> treatment name from sourceMetadata.
+
+    Searches for a numeric group ID column and a treatment/drug label column.
+    Works for both DFP (NumericGroupID + drugId) and CNS (NumericGroupID + treatment).
+    """
     p = Path(dataset_dir)
-    csvs = list(p.glob("*_sourceMetadata.csv"))
-    if not csvs:
-        raise FileNotFoundError(f"No *_sourceMetadata.csv in {dataset_dir}")
-    return str(csvs[0])
+    id_to_name: dict[int, str] = {}
+
+    meta_files = list(p.glob("*_sourceMetadata.csv"))
+    if not meta_files:
+        print(f"  WARNING: no *_sourceMetadata.csv in {dataset_dir}")
+        return id_to_name
+
+    meta = pd.read_csv(str(meta_files[0]))
+
+    # Find the numeric group ID column
+    gid_col = None
+    for candidate in ["NumericGroupID", "numericGroupId", "numericGroupIds"]:
+        if candidate in meta.columns:
+            gid_col = candidate
+            break
+
+    # Find the treatment label column
+    treat_col = None
+    for candidate in ["treatment", "drugId", "drug1"]:
+        if candidate in meta.columns:
+            treat_col = candidate
+            break
+
+    if gid_col and treat_col:
+        for _, row in meta[[gid_col, treat_col]].drop_duplicates().iterrows():
+            gid = int(row[gid_col])
+            id_to_name[gid] = str(row[treat_col])
+        print(f"  Treatment mapping ({gid_col} -> {treat_col}): "
+              f"{len(set(id_to_name.values()))} unique treatments "
+              f"from {len(id_to_name)} group IDs")
+    else:
+        print(f"  WARNING: could not find group ID col ({gid_col}) "
+              f"or treatment col ({treat_col}) in {meta_files[0]}")
+
+    return id_to_name
 
 
 def load_mat_dataset(
@@ -53,7 +88,7 @@ def load_mat_dataset(
     """Load traces from .mat, pool to n_bins features, return (features, labels, names, lda).
 
     Args:
-        dataset_dir: Directory containing *_traceMatrix.mat and *_sourceMetadata.csv
+        dataset_dir: Directory containing *_traceMatrix.mat
         n_bins: Number of bins to adaptive-average-pool each trace into
         min_samples_per_class: Drop classes with fewer samples
         use_lda: If True, apply SVD-LDA after pooling + z-score
@@ -65,7 +100,6 @@ def load_mat_dataset(
         lda_model: fitted LDA or None
     """
     mat_path = _find_mat(dataset_dir)
-    meta_path = _find_metadata(dataset_dir)
 
     print(f"Loading {mat_path} ...")
     with h5py.File(mat_path, "r") as f:
@@ -75,36 +109,8 @@ def load_mat_dataset(
 
     print(f"  Raw: {traces.shape[0]} traces x {traces.shape[1]} time points")
 
-    # ── Map numericGroupIds to treatment names via sourceMetadata ──
-    meta = pd.read_csv(meta_path)
-    # sourceMetadata has NumericGroupID and treatment columns
-    id_to_name = {}
-    if "NumericGroupID" in meta.columns and "treatment" in meta.columns:
-        mapping = meta[["NumericGroupID", "treatment"]].drop_duplicates()
-        for _, row in mapping.iterrows():
-            gid = int(row["NumericGroupID"])
-            name = str(row["treatment"])
-            id_to_name[gid] = name
-    elif "numericGroupId" in meta.columns and "drug1" in meta.columns:
-        mapping = meta[["numericGroupId", "drug1"]].drop_duplicates()
-        for _, row in mapping.iterrows():
-            gid = int(row["numericGroupId"])
-            name = str(row["drug1"])
-            id_to_name[gid] = name
-
-    # If no mapping found, try the comprehensiveSft as fallback
-    if not id_to_name:
-        sft_files = list(Path(dataset_dir).glob("*_comprehensiveSft.csv"))
-        if sft_files:
-            sft = pd.read_csv(str(sft_files[0]))
-            for col in ["drug1", "treatment"]:
-                if col in sft.columns and "numericGroupId" in sft.columns:
-                    mapping = sft[["numericGroupId", col]].drop_duplicates()
-                    for _, row in mapping.iterrows():
-                        gid = int(row["numericGroupId"])
-                        id_to_name[gid] = str(row[col])
-                    break
-
+    # ── Map numericGroupIds to treatment names ──
+    id_to_name = _build_group_to_treatment(dataset_dir)
     if not id_to_name:
         # Last resort: just use numeric IDs as names
         for gid in np.unique(group_ids):
