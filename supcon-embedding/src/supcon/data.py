@@ -64,12 +64,13 @@ def _find_csv(dataset_dir: str, pattern: str) -> str:
 
 
 def discover_feature_columns(
-    dfp_csv: str, cns_csv: str, max_nan_rate: float = 0.5,
+    dfp_csv: str, cns_csv: str, top_k: int = 825,
 ) -> list[str]:
-    """Return sorted list of numeric feature columns shared by both CSVs.
+    """Return the top_k numeric feature columns with lowest NaN rate in both CSVs.
 
-    Only keeps columns where NaN rate is below max_nan_rate in BOTH datasets.
-    This prevents NaN-pattern leakage between datasets.
+    Ranks by max(dfp_nan_rate, cns_nan_rate) per column, takes the top_k
+    most complete features. This ensures both datasets have real values
+    and prevents NaN-pattern leakage.
     """
     dfp = pd.read_csv(dfp_csv)
     cns = pd.read_csv(cns_csv)
@@ -79,16 +80,17 @@ def discover_feature_columns(
         if c not in METADATA_COLS
         and dfp[c].dtype in ("float64", "float32", "int64", "int32")
     ])
-    # Filter by NaN rate in both datasets
-    feature_cols = []
+    # Rank by worst NaN rate across the two datasets
+    scored = []
     for c in candidates:
-        dfp_nan = dfp[c].isna().mean()
-        cns_nan = cns[c].isna().mean()
-        if dfp_nan <= max_nan_rate and cns_nan <= max_nan_rate:
-            feature_cols.append(c)
+        worst_nan = max(dfp[c].isna().mean(), cns[c].isna().mean())
+        scored.append((worst_nan, c))
+    scored.sort()  # lowest NaN first
+    feature_cols = [c for _, c in scored[:top_k]]
+    cutoff_nan = scored[min(top_k, len(scored)) - 1][0] if scored else 0
     print(f"  Feature columns: {len(feature_cols)} / {len(candidates)} "
-          f"(filtered at {max_nan_rate:.0%} NaN threshold)")
-    return feature_cols
+          f"(top {top_k}, worst NaN at cutoff: {cutoff_nan:.1%})")
+    return sorted(feature_cols)
 
 
 def load_sft_dataset(

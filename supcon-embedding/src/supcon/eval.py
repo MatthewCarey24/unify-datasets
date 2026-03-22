@@ -41,11 +41,17 @@ def embed(model: ResidualMLP, features: torch.Tensor, device: torch.device, batc
 
 
 def compute_leakage_auroc(emb_a: np.ndarray, emb_b: np.ndarray) -> float:
+    """Cross-validated AUROC for classifying dataset A vs B in embedding space."""
+    from sklearn.model_selection import cross_val_predict
     X = np.concatenate([emb_a, emb_b], axis=0)
     y = np.array([0] * len(emb_a) + [1] * len(emb_b))
+    # Subsample if too large (CV on 145K is slow)
+    if len(X) > 20000:
+        rng = np.random.default_rng(42)
+        idx = rng.choice(len(X), size=20000, replace=False)
+        X, y = X[idx], y[idx]
     clf = LogisticRegression(max_iter=1000, solver="lbfgs")
-    clf.fit(X, y)
-    proba = clf.predict_proba(X)[:, 1]
+    proba = cross_val_predict(clf, X, y, cv=5, method="predict_proba")[:, 1]
     return float(roc_auc_score(y, proba))
 
 
