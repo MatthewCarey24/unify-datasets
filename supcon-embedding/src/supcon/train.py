@@ -86,12 +86,14 @@ def train(cfg: dict) -> Path:
 
     # ── Optimizer ──
     opt_cfg = cfg.get("optimizer", {})
+    lr = opt_cfg.get("lr", 5e-3)
     optimizer = torch.optim.Adam(
         model.parameters(),
-        lr=opt_cfg.get("lr", 1e-3),
+        lr=lr,
         weight_decay=opt_cfg.get("weight_decay", 1e-4),
     )
-    max_steps = opt_cfg.get("max_steps", 5000)
+    max_steps = opt_cfg.get("max_steps", 20000)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=max_steps, eta_min=1e-5)
 
     # ── Output ──
     run_cfg = cfg.get("run", {})
@@ -116,10 +118,12 @@ def train(cfg: dict) -> Path:
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
+            scheduler.step()
             step += 1
 
             if step % 100 == 0 or step == 1:
-                print(f"  step {step:>5d}/{max_steps}  loss={loss.item():.4f}")
+                cur_lr = scheduler.get_last_lr()[0]
+                print(f"  step {step:>5d}/{max_steps}  loss={loss.item():.4f}  lr={cur_lr:.2e}")
 
     # ── Save checkpoint ──
     ckpt_path = output_dir / "checkpoint.pt"
