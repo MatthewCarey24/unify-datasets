@@ -1,0 +1,29 @@
+# Phase 2: LDA preprocessing (825 -> 21 dims) + SupCon
+# Target: compare to Paul's LDA+MLP sig=0.758
+
+[run]
+seed = 42
+output_dir = "outputs/phase2_lda"
+eval_every = 5000
+
+[data]
+csv_path = "data/DFP0395_comprehensiveSft.csv"
+n_features = 825
+use_lda = true
+exclude_dmso = true
+
+[model]
+hidden_dims = [128, 128]   # Smaller model for lower-dim LDA input
+embed_dim = 128
+
+[loss]
+temperature = 0.4
+use_auxiliary = false
+
+[sampler]
+k_samples = 48
+
+[optimizer]
+lr = 5e-3
+weight_decay = 1e-4
+max_steps = 20000

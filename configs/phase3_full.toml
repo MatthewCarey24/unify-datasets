@@ -1,0 +1,33 @@
+# Phase 3: Full Paul-style loss (SupCon + align + repulse + ordinal dose)
+# Target: compare to Paul's dual-label sig=0.862 -> temp sweep sig=0.909
+
+[run]
+seed = 42
+output_dir = "outputs/phase3_full"
+eval_every = 5000
+
+[data]
+csv_path = "data/DFP0395_comprehensiveSft.csv"
+n_features = 825
+use_lda = true
+exclude_dmso = true
+
+[model]
+hidden_dims = [128, 128]
+embed_dim = 128
+
+[loss]
+temperature = 0.4
+use_auxiliary = true
+w_supcon = 1.0
+w_align = 0.5
+w_repulse = 0.5
+w_ordinal = 0.3
+
+[sampler]
+k_samples = 48
+
+[optimizer]
+lr = 5e-3
+weight_decay = 1e-4
+max_steps = 20000

@@ -1,2 +1,6 @@
-subcon-embedding/outputs
+outputs/
+data/
+__pycache__/
+*.pyc
+*.egg-info/
 .claude

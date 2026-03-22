@@ -1,0 +1,30 @@
+# Phase 1: Basic SupCon with raw 825 features, compound-only labels
+# Target: establish baseline, compare to Paul's 825-feature baseline sig=0.561
+
+[run]
+seed = 42
+output_dir = "outputs/phase1_supcon_raw"
+eval_every = 5000
+
+[data]
+csv_path = "data/DFP0395_comprehensiveSft.csv"
+n_features = 825
+use_lda = false
+exclude_dmso = true
+
+[model]
+hidden_dims = [512, 256, 128]
+embed_dim = 128
+
+[loss]
+temperature = 0.4
+use_auxiliary = false
+
+[sampler]
+# p_classes defaults to all available compounds
+k_samples = 48
+
+[optimizer]
+lr = 5e-3
+weight_decay = 1e-4
+max_steps = 20000
