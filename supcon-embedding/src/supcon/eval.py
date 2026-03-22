@@ -91,15 +91,28 @@ def evaluate_separate(
     print("Embedding CNS...")
     emb_cns = embed(model_cns, feat_cns, device)
 
+    print("Computing leakage...")
     leakage = compute_leakage_auroc(emb_dfp, emb_cns)
+
+    # Per-dataset silhouette (treatment separation within each dataset)
+    dfp_labels = [names_dfp[l] for l in lab_dfp.tolist()]
+    cns_labels = [names_cns[l] for l in lab_cns.tolist()]
+    print("Computing DFP silhouette...")
+    sil_dfp = compute_silhouette(emb_dfp, dfp_labels)
+    print("Computing CNS silhouette...")
+    sil_cns = compute_silhouette(emb_cns, cns_labels)
+
+    # Combined silhouette
     all_emb = np.concatenate([emb_dfp, emb_cns], axis=0)
-    all_labels = [names_dfp[l] for l in lab_dfp.tolist()] + [names_cns[l] for l in lab_cns.tolist()]
-    sil = compute_silhouette(all_emb, all_labels)
+    all_labels = dfp_labels + cns_labels
+    sil_combined = compute_silhouette(all_emb, all_labels)
 
     return {
         "condition": "separate",
         "leakage_auroc": round(leakage, 4),
-        "separation_silhouette": round(sil, 4),
+        "dfp_silhouette": round(sil_dfp, 4),
+        "cns_silhouette": round(sil_cns, 4),
+        "combined_silhouette": round(sil_combined, 4),
         "n_dfp": len(emb_dfp),
         "n_cns": len(emb_cns),
     }
@@ -127,14 +140,25 @@ def evaluate_joint(
     emb_dfp = all_emb[is_dfp.numpy()]
     emb_cns = all_emb[is_cns.numpy()]
 
+    print("Computing leakage...")
     leakage = compute_leakage_auroc(emb_dfp, emb_cns)
-    all_labels = [label_names[l] for l in labels.tolist()]
-    sil = compute_silhouette(all_emb, all_labels)
+
+    # Per-dataset silhouette (treatment separation within each dataset's embeddings)
+    all_label_strs = [label_names[l] for l in labels.tolist()]
+    dfp_label_strs = [s for s, d in zip(all_label_strs, is_dfp.tolist()) if d]
+    cns_label_strs = [s for s, d in zip(all_label_strs, is_cns.tolist()) if d]
+    print("Computing DFP silhouette...")
+    sil_dfp = compute_silhouette(emb_dfp, dfp_label_strs)
+    print("Computing CNS silhouette...")
+    sil_cns = compute_silhouette(emb_cns, cns_label_strs)
+    sil_combined = compute_silhouette(all_emb, all_label_strs)
 
     return {
         "condition": "joint",
         "leakage_auroc": round(leakage, 4),
-        "separation_silhouette": round(sil, 4),
+        "dfp_silhouette": round(sil_dfp, 4),
+        "cns_silhouette": round(sil_cns, 4),
+        "combined_silhouette": round(sil_combined, 4),
         "n_dfp": int(is_dfp.sum()),
         "n_cns": int(is_cns.sum()),
     }
