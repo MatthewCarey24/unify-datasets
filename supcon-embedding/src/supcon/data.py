@@ -326,16 +326,74 @@ class InMemoryDataset(torch.utils.data.Dataset):
         return self.features[idx], self.labels[idx]
 
 
+class BalancedBatchSampler(torch.utils.data.Sampler):
+    """Sample P classes per batch, K samples per class -> batch_size = P*K.
+
+    Guarantees every anchor has at least K-1 positive pairs.
+    Standard practice for metric learning / SupCon.
+    """
+
+    def __init__(self, labels: torch.Tensor, P: int = 32, K: int = 32):
+        self.labels = labels.numpy()
+        self.P = P
+        self.K = K
+        self.batch_size = P * K
+
+        # Build class -> indices mapping
+        self.class_indices: dict[int, np.ndarray] = {}
+        for cls in np.unique(self.labels):
+            self.class_indices[cls] = np.where(self.labels == cls)[0]
+        self.classes = list(self.class_indices.keys())
+
+        # Filter to classes with at least 2 samples
+        self.classes = [c for c in self.classes if len(self.class_indices[c]) >= 2]
+        if len(self.classes) < P:
+            self.P = len(self.classes)
+            self.batch_size = self.P * K
+
+    def __iter__(self):
+        rng = np.random.default_rng()
+        # Yield batches indefinitely (training loop controls stopping)
+        while True:
+            # Pick P random classes
+            chosen = rng.choice(self.classes, size=self.P, replace=False)
+            batch = []
+            for cls in chosen:
+                idxs = self.class_indices[cls]
+                if len(idxs) >= self.K:
+                    picked = rng.choice(idxs, size=self.K, replace=False)
+                else:
+                    picked = rng.choice(idxs, size=self.K, replace=True)
+                batch.extend(picked.tolist())
+            yield batch
+
+    def __len__(self):
+        # Approximate: total samples / batch_size
+        return len(self.labels) // self.batch_size
+
+
 def make_dataloader(
     features: torch.Tensor,
     labels: torch.Tensor,
     batch_size: int = 1024,
     shuffle: bool = True,
+    balanced: bool = True,
 ) -> torch.utils.data.DataLoader:
     ds = InMemoryDataset(features, labels)
-    return torch.utils.data.DataLoader(
-        ds,
-        batch_size=min(batch_size, len(ds)),
-        shuffle=shuffle,
-        drop_last=True,
-    )
+    if balanced:
+        # P classes * K samples = batch_size
+        # Try P=32, K=32 -> 1024. Adjust if fewer classes.
+        n_classes = len(labels.unique())
+        P = min(32, n_classes)
+        K = max(2, batch_size // P)
+        sampler = BalancedBatchSampler(labels, P=P, K=K)
+        print(f"  Balanced sampler: P={P} classes, K={K} per class, "
+              f"batch={P*K}")
+        return torch.utils.data.DataLoader(ds, batch_sampler=sampler)
+    else:
+        return torch.utils.data.DataLoader(
+            ds,
+            batch_size=min(batch_size, len(ds)),
+            shuffle=shuffle,
+            drop_last=True,
+        )
