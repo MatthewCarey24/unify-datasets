@@ -2,15 +2,13 @@
 mode = "joint"
 dfp_dir = "/data/dataset/DFP"
 cns_dir = "/data/dataset/CNS"
-n_bins = 825
 batch_size = 1024
 
 [model]
-hidden_dims = [512, 256, 128]
+hidden_dims = [128, 128]
 embed_dim = 128
 
 [loss]
-type = "supcon"
 temperature = 0.07
 
 [optimizer]
