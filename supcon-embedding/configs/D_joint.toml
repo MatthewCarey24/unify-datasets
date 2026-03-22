@@ -3,7 +3,7 @@ mode = "joint"
 dfp_dir = "/data/dataset/DFP"
 cns_dir = "/data/dataset/CNS"
 n_bins = 825
-batch_size = 256
+batch_size = 1024
 
 [model]
 hidden_dims = [512, 256, 128]
@@ -16,7 +16,7 @@ temperature = 0.07
 [optimizer]
 lr = 1e-3
 weight_decay = 1e-4
-max_steps = 5000
+max_steps = 20000
 
 [run]
 seed = 42
