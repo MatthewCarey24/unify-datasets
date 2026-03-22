@@ -7,9 +7,9 @@ dependencies = [
     "torch>=2.6",
     "numpy>=1.26",
     "scikit-learn>=1.4",
-    "webdataset>=0.2.86",
+    "h5py>=3.10",
     "tomli>=2.0",
-    "pandas>=3.0.1",
+    "pandas>=2.0",
 ]
 
 [project.scripts]

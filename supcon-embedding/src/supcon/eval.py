@@ -11,17 +11,11 @@ import torch
 from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import roc_auc_score, silhouette_score
 
-try:
-    import tomllib
-except ImportError:
-    import tomli as tomllib  # type: ignore[no-redef]
-
-from supcon.data import discover_feature_columns, load_cns, load_dfp
+from supcon.data import load_mat_dataset
 from supcon.model import ResidualMLP
 
 
 def load_model_from_checkpoint(ckpt_path: str, device: torch.device) -> ResidualMLP:
-    """Load a ResidualMLP from a training checkpoint."""
     ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
     cfg = ckpt["config"]
     model_cfg = cfg.get("model", {})
@@ -38,7 +32,6 @@ def load_model_from_checkpoint(ckpt_path: str, device: torch.device) -> Residual
 
 @torch.no_grad()
 def embed(model: ResidualMLP, features: torch.Tensor, device: torch.device, batch_size: int = 1024) -> np.ndarray:
-    """Embed all samples, return [N, D] numpy array."""
     all_embs = []
     for i in range(0, len(features), batch_size):
         batch = features[i : i + batch_size].to(device)
@@ -48,7 +41,6 @@ def embed(model: ResidualMLP, features: torch.Tensor, device: torch.device, batc
 
 
 def compute_leakage_auroc(emb_a: np.ndarray, emb_b: np.ndarray) -> float:
-    """Logistic regression AUROC to classify dataset A vs B in embedding space."""
     X = np.concatenate([emb_a, emb_b], axis=0)
     y = np.array([0] * len(emb_a) + [1] * len(emb_b))
     clf = LogisticRegression(max_iter=1000, solver="lbfgs")
@@ -58,14 +50,12 @@ def compute_leakage_auroc(emb_a: np.ndarray, emb_b: np.ndarray) -> float:
 
 
 def compute_silhouette(embeddings: np.ndarray, labels: list[str]) -> float:
-    """Silhouette score by treatment label."""
     unique = sorted(set(labels))
     if len(unique) < 2:
         return 0.0
     label_map = {name: i for i, name in enumerate(unique)}
     int_labels = np.array([label_map[t] for t in labels])
 
-    # Subsample if too large (silhouette is O(n^2))
     n = len(embeddings)
     if n > 10000:
         rng = np.random.default_rng(42)
@@ -76,22 +66,21 @@ def compute_silhouette(embeddings: np.ndarray, labels: list[str]) -> float:
     return float(silhouette_score(embeddings, int_labels))
 
 
-def evaluate_separate(ckpt_dfp: str, ckpt_cns: str, dfp_lda: bool = False, cns_lda: bool = False) -> dict:
-    """Evaluate separate condition: two independently trained encoders."""
+def evaluate_separate(
+    ckpt_dfp: str, ckpt_cns: str,
+    dfp_dir: str, cns_dir: str,
+    dfp_lda: bool = False, cns_lda: bool = False,
+    n_bins: int = 825,
+) -> dict:
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     model_dfp = load_model_from_checkpoint(ckpt_dfp, device)
     model_cns = load_model_from_checkpoint(ckpt_cns, device)
 
-    feature_columns = discover_feature_columns(
-        "C:/data/dataset/DFP/DFP0395_comprehensiveSft.csv",
-        "C:/data/dataset/CNS/CNS0091_comprehensiveSft.csv",
-    )
-
     print("Loading DFP...")
-    feat_dfp, lab_dfp, names_dfp, _ = load_dfp(feature_columns=feature_columns, use_lda=dfp_lda)
+    feat_dfp, lab_dfp, names_dfp, _ = load_mat_dataset(dfp_dir, n_bins=n_bins, use_lda=dfp_lda)
     print("Loading CNS...")
-    feat_cns, lab_cns, names_cns, _ = load_cns(feature_columns=feature_columns, use_lda=cns_lda)
+    feat_cns, lab_cns, names_cns, _ = load_mat_dataset(cns_dir, n_bins=n_bins, use_lda=cns_lda)
 
     print("Embedding DFP...")
     emb_dfp = embed(model_dfp, feat_dfp, device)
@@ -113,21 +102,19 @@ def evaluate_separate(ckpt_dfp: str, ckpt_cns: str, dfp_lda: bool = False, cns_l
     }
 
 
-def evaluate_joint(ckpt_joint: str) -> dict:
-    """Evaluate joint condition: single encoder for both datasets."""
+def evaluate_joint(
+    ckpt_joint: str,
+    dfp_dir: str, cns_dir: str,
+    n_bins: int = 825,
+) -> dict:
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     model = load_model_from_checkpoint(ckpt_joint, device)
 
-    feature_columns = discover_feature_columns(
-        "C:/data/dataset/DFP/DFP0395_comprehensiveSft.csv",
-        "C:/data/dataset/CNS/CNS0091_comprehensiveSft.csv",
-    )
-
     print("Loading DFP...")
-    feat_dfp, lab_dfp, names_dfp, _ = load_dfp(feature_columns=feature_columns)
+    feat_dfp, lab_dfp, names_dfp, _ = load_mat_dataset(dfp_dir, n_bins=n_bins)
     print("Loading CNS...")
-    feat_cns, lab_cns, names_cns, _ = load_cns(feature_columns=feature_columns)
+    feat_cns, lab_cns, names_cns, _ = load_mat_dataset(cns_dir, n_bins=n_bins)
 
     print("Embedding DFP...")
     emb_dfp = embed(model, feat_dfp, device)
@@ -151,16 +138,20 @@ def evaluate_joint(ckpt_joint: str) -> dict:
 
 def main():
     parser = argparse.ArgumentParser(description="Evaluate SupCon embeddings")
+    parser.add_argument("--dfp-dir", default="/data/dataset/DFP")
+    parser.add_argument("--cns-dir", default="/data/dataset/CNS")
+    parser.add_argument("--n-bins", type=int, default=825)
+
     sub = parser.add_subparsers(dest="mode", required=True)
 
-    sep = sub.add_parser("separate", help="Evaluate separately trained encoders")
+    sep = sub.add_parser("separate")
     sep.add_argument("--ckpt-dfp", required=True)
     sep.add_argument("--ckpt-cns", required=True)
-    sep.add_argument("--dfp-lda", action="store_true", help="Apply LDA to DFP features")
-    sep.add_argument("--cns-lda", action="store_true", help="Apply LDA to CNS features")
+    sep.add_argument("--dfp-lda", action="store_true")
+    sep.add_argument("--cns-lda", action="store_true")
     sep.add_argument("-o", "--output", default=None)
 
-    jnt = sub.add_parser("joint", help="Evaluate jointly trained encoder")
+    jnt = sub.add_parser("joint")
     jnt.add_argument("--ckpt", required=True)
     jnt.add_argument("-o", "--output", default=None)
 
@@ -169,10 +160,15 @@ def main():
     if args.mode == "separate":
         result = evaluate_separate(
             args.ckpt_dfp, args.ckpt_cns,
+            args.dfp_dir, args.cns_dir,
             dfp_lda=args.dfp_lda, cns_lda=args.cns_lda,
+            n_bins=args.n_bins,
         )
     else:
-        result = evaluate_joint(args.ckpt)
+        result = evaluate_joint(
+            args.ckpt, args.dfp_dir, args.cns_dir,
+            n_bins=args.n_bins,
+        )
 
     print(json.dumps(result, indent=2))
 

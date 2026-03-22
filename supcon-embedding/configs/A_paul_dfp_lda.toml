@@ -1,9 +1,9 @@
-# Condition A: Replicate Paul's DFP — LDA + SupCon (temp=0.4)
 [data]
 mode = "dfp"
+dfp_dir = "/data/dataset/DFP"
+cns_dir = "/data/dataset/CNS"
+n_bins = 825
 use_lda = true
-dfp_csv = "C:/data/dataset/DFP/DFP0395_comprehensiveSft.csv"
-cns_csv = "C:/data/dataset/CNS/CNS0091_comprehensiveSft.csv"
 batch_size = 256
 
 [model]
@@ -13,10 +13,6 @@ embed_dim = 128
 [loss]
 type = "paul_dfp"
 temperature = 0.40
-w_supcon = 1.0
-w_align = 0.5
-w_repulse = 0.5
-w_ordinal = 0.3
 
 [optimizer]
 lr = 1e-3

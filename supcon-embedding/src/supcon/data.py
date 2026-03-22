@@ -1,14 +1,15 @@
-"""Data loader for SupCon experiment using comprehensiveSft CSV files.
+"""Data loader for SupCon experiment using traceMatrix .mat files.
 
 Data sources:
-  DFP: DFP0395_comprehensiveSft.csv — treatment column = "drug1"
-  CNS: CNS0091_comprehensiveSft.csv — treatment from sourceMetadata join
+  Each dataset dir contains:
+    - *_traceMatrix.mat  (HDF5 v7.3)
+        normTraceMatrix: [11459, N] float32 traces
+        numericGroupIds: [1, N]     treatment group IDs
+    - *_sourceMetadata.csv          treatment name mapping
+    - dataset_info.json             epoch boundaries
 
-Feature columns: all shared numeric columns between DFP & CNS CSVs,
-excluding known metadata columns. NaN filled with 0.
-
-Optional LDA preprocessing (Paul's pipeline for DFP):
-  966 features -> z-score -> SVD-LDA -> n_classes-1 dims
+Features: adaptive-average-pool raw trace from 11459 -> n_bins (default 825).
+No NaN, clean signal, identical format for both datasets.
 """
 
 from __future__ import annotations
@@ -16,147 +17,134 @@ from __future__ import annotations
 from collections import Counter
 from pathlib import Path
 
+import h5py
+import json
 import numpy as np
 import pandas as pd
 import torch
+import torch.nn.functional as F
 from sklearn.discriminant_analysis import LinearDiscriminantAnalysis
 
 
-# ── Metadata columns to exclude from features ──────────────────────────
-METADATA_COLS = {
-    "AnalysisID", "CellId", "CellType", "DishId", "ExperimentID", "FOVNumber",
-    "Genotype", "ImagingStart", "Operator", "PlateId", "PlateNumber", "PlateType",
-    "Project", "Scope", "SourceID", "SourceNumber", "WellDescription",
-    "cellPlateBarcode", "column", "compoundPlateBarcode", "compressionMethod",
-    "compressionStatus", "datetime", "div", "expDescription", "experimentFailed",
-    "fov", "numericGroupId", "outOfFocus", "repeatNumber", "row", "schmutz",
-    "autofluorescence", "cellNumber", "BaselineFluorescence", "protocolIdx",
-    "focusGLVA", "focusGLVN", "focusHELM", "focusLLSP", "focusSATU",
-    "focusTENG", "focusTENV", "experimentId", "wellId",
-    "fovId", "fovPosition", "fullProtocolName", "gliaDensity", "gliaLot",
-    "imagingBuffer", "imagingBufferLot", "operatorName", "plateMapName", "round",
-    "sampleTime_units", "scopeName", "sourceName", "synapticBlockers",
-    "virus1", "virus1Volume", "virus2", "virus2Volume", "sampleTime", "sourceNumber",
-    # DFP-only metadata
-    "drug1", "drug1Concentration", "drug1ConcentrationUnits", "drug1Concentration_Units",
-    "platingDensity",
-    # CNS-only metadata
-    "cas9Treatment", "cas9Volume", "cellDensity", "libraryPlate",
-    "screeningWellContents", "sgRNA", "sgRNAVolume",
-    # Injected treatment column
-    "treatment",
-}
+def _find_mat(dataset_dir: str) -> str:
+    """Find the *_traceMatrix.mat file in a dataset directory."""
+    p = Path(dataset_dir)
+    mats = list(p.glob("*_traceMatrix.mat"))
+    if not mats:
+        raise FileNotFoundError(f"No *_traceMatrix.mat in {dataset_dir}")
+    return str(mats[0])
 
 
-def discover_feature_columns(
-    dfp_csv: str,
-    cns_csv: str,
-) -> list[str]:
-    """Return sorted list of numeric feature columns shared by both CSVs."""
-    dfp_head = pd.read_csv(dfp_csv, nrows=0)
-    cns_head = pd.read_csv(cns_csv, nrows=0)
-    shared = sorted(set(dfp_head.columns) & set(cns_head.columns))
-
-    # Read a small sample to check dtypes
-    dfp_sample = pd.read_csv(dfp_csv, nrows=50)
-    feature_cols = [
-        c for c in shared
-        if c not in METADATA_COLS
-        and dfp_sample[c].dtype in ("float64", "float32", "int64", "int32")
-    ]
-    return sorted(feature_cols)
+def _find_metadata(dataset_dir: str) -> str:
+    """Find the *_sourceMetadata.csv file in a dataset directory."""
+    p = Path(dataset_dir)
+    csvs = list(p.glob("*_sourceMetadata.csv"))
+    if not csvs:
+        raise FileNotFoundError(f"No *_sourceMetadata.csv in {dataset_dir}")
+    return str(csvs[0])
 
 
-def load_csv_dataset(
-    csv_path: str,
-    perturbation_col: str,
-    feature_columns: list[str],
-    metadata_csv: str | None = None,
-    metadata_join_keys: list[str] | None = None,
-    metadata_rename: dict[str, str] | None = None,
+def load_mat_dataset(
+    dataset_dir: str,
+    n_bins: int = 825,
     min_samples_per_class: int = 2,
     use_lda: bool = False,
-    lda_model: LinearDiscriminantAnalysis | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, list[str], LinearDiscriminantAnalysis | None]:
-    """Load a comprehensiveSft CSV into (features, labels, label_names).
+    """Load traces from .mat, pool to n_bins features, return (features, labels, names, lda).
 
     Args:
-        csv_path: Path to comprehensiveSft CSV.
-        perturbation_col: Column name for treatment label.
-        feature_columns: Which columns to use as features.
-        metadata_csv: Optional path to sourceMetadata CSV for treatment join.
-        metadata_join_keys: Columns to join on.
-        metadata_rename: Rename dict applied to metadata before join.
-        min_samples_per_class: Drop classes with fewer samples.
-        use_lda: If True, apply SVD-LDA dimensionality reduction.
-        lda_model: Pre-fitted LDA model to transform with (skip fitting).
-            If None and use_lda=True, fits a new LDA on this data.
+        dataset_dir: Directory containing *_traceMatrix.mat and *_sourceMetadata.csv
+        n_bins: Number of bins to adaptive-average-pool each trace into
+        min_samples_per_class: Drop classes with fewer samples
+        use_lda: If True, apply SVD-LDA after pooling + z-score
 
     Returns:
-        features: [N, F] float32 tensor (F = n_classes-1 if LDA)
+        features: [N, n_bins] float32 tensor (or [N, n_classes-1] if LDA)
         labels:   [N] int64 tensor
         label_names: sorted list mapping int -> treatment string
-        lda_model: fitted LDA (or None if use_lda=False)
+        lda_model: fitted LDA or None
     """
-    print(f"Loading {csv_path} ...")
-    df = pd.read_csv(csv_path)
+    mat_path = _find_mat(dataset_dir)
+    meta_path = _find_metadata(dataset_dir)
 
-    # ── Join with sourceMetadata if treatment column is missing ──
-    if perturbation_col not in df.columns and metadata_csv is not None:
-        meta = pd.read_csv(metadata_csv)
-        if metadata_rename:
-            meta = meta.rename(columns=metadata_rename)
-        join_keys = metadata_join_keys or ["SourceNumber", "WellDescription"]
-        meta_cols = join_keys + [perturbation_col]
-        meta_subset = meta[meta_cols].drop_duplicates(subset=join_keys)
-        df = df.merge(meta_subset, on=join_keys, how="left")
-        n_missing = df[perturbation_col].isna().sum()
-        if n_missing > 0:
-            print(f"  WARNING: {n_missing} rows have no treatment after join")
+    print(f"Loading {mat_path} ...")
+    with h5py.File(mat_path, "r") as f:
+        # normTraceMatrix is [11459, N] — columns are samples
+        traces = f["normTraceMatrix"][:].T  # -> [N, 11459]
+        group_ids = f["numericGroupIds"][0].astype(int)  # [N]
 
-    # ── Drop rows without treatment label ──
-    df = df.dropna(subset=[perturbation_col])
-    treatments = df[perturbation_col].astype(str)
+    print(f"  Raw: {traces.shape[0]} traces x {traces.shape[1]} time points")
+
+    # ── Map numericGroupIds to treatment names via sourceMetadata ──
+    meta = pd.read_csv(meta_path)
+    # sourceMetadata has NumericGroupID and treatment columns
+    id_to_name = {}
+    if "NumericGroupID" in meta.columns and "treatment" in meta.columns:
+        mapping = meta[["NumericGroupID", "treatment"]].drop_duplicates()
+        for _, row in mapping.iterrows():
+            gid = int(row["NumericGroupID"])
+            name = str(row["treatment"])
+            id_to_name[gid] = name
+    elif "numericGroupId" in meta.columns and "drug1" in meta.columns:
+        mapping = meta[["numericGroupId", "drug1"]].drop_duplicates()
+        for _, row in mapping.iterrows():
+            gid = int(row["numericGroupId"])
+            name = str(row["drug1"])
+            id_to_name[gid] = name
+
+    # If no mapping found, try the comprehensiveSft as fallback
+    if not id_to_name:
+        sft_files = list(Path(dataset_dir).glob("*_comprehensiveSft.csv"))
+        if sft_files:
+            sft = pd.read_csv(str(sft_files[0]))
+            for col in ["drug1", "treatment"]:
+                if col in sft.columns and "numericGroupId" in sft.columns:
+                    mapping = sft[["numericGroupId", col]].drop_duplicates()
+                    for _, row in mapping.iterrows():
+                        gid = int(row["numericGroupId"])
+                        id_to_name[gid] = str(row[col])
+                    break
+
+    if not id_to_name:
+        # Last resort: just use numeric IDs as names
+        for gid in np.unique(group_ids):
+            id_to_name[gid] = f"group_{gid}"
+
+    # ── Map group IDs to treatment strings ──
+    treatments = np.array([id_to_name.get(gid, f"group_{gid}") for gid in group_ids])
 
     # ── Filter rare classes ──
     counts = Counter(treatments)
     valid = {t for t, c in counts.items() if c >= min_samples_per_class}
-    mask = treatments.isin(valid)
-    df = df[mask]
+    mask = np.array([t in valid for t in treatments])
+    traces = traces[mask]
     treatments = treatments[mask]
 
-    # ── Extract features ──
-    present_cols = [c for c in feature_columns if c in df.columns]
-    features_df = df[present_cols].astype(np.float32)
-    features_df = features_df.fillna(0.0)
+    # ── Adaptive average pool: 11459 -> n_bins ──
+    traces_t = torch.tensor(traces, dtype=torch.float32)
+    # F.adaptive_avg_pool1d expects [N, C, L] — use C=1
+    pooled = F.adaptive_avg_pool1d(traces_t.unsqueeze(1), n_bins).squeeze(1)
+    features_np = pooled.numpy()
 
-    # ── Per-feature z-score normalisation ──
-    mean = features_df.mean()
-    std = features_df.std().replace(0.0, 1.0)
-    features_df = (features_df - mean) / std
+    # ── Per-feature z-score ──
+    mean = features_np.mean(axis=0)
+    std = features_np.std(axis=0)
+    std[std == 0] = 1.0
+    features_np = (features_np - mean) / std
 
     # ── Encode labels ──
-    label_names = sorted(treatments.unique())
+    label_names = sorted(set(treatments))
     label_map = {name: idx for idx, name in enumerate(label_names)}
-    labels = treatments.map(label_map).values
+    labels = np.array([label_map[t] for t in treatments])
 
-    features_np = features_df.values.astype(np.float32)
-
-    # ── Optional SVD-LDA ──
+    # ── Optional LDA ──
     fitted_lda = None
     if use_lda:
-        if lda_model is not None:
-            # Transform with pre-fitted model
-            features_np = lda_model.transform(features_np).astype(np.float32)
-            print(f"  LDA transform -> {features_np.shape[1]} dims (pre-fitted)")
-        else:
-            # Fit new LDA on this data
-            lda = LinearDiscriminantAnalysis(solver="svd")
-            features_np = lda.fit_transform(features_np, labels).astype(np.float32)
-            fitted_lda = lda
-            print(f"  LDA fit+transform -> {features_np.shape[1]} dims "
-                  f"(explained variance ratio sum: "
-                  f"{lda.explained_variance_ratio_.sum():.3f})")
+        lda = LinearDiscriminantAnalysis(solver="svd")
+        features_np = lda.fit_transform(features_np, labels).astype(np.float32)
+        fitted_lda = lda
+        print(f"  LDA -> {features_np.shape[1]} dims "
+              f"(variance ratio sum: {lda.explained_variance_ratio_.sum():.3f})")
 
     features_tensor = torch.tensor(features_np, dtype=torch.float32)
     labels_tensor = torch.tensor(labels, dtype=torch.int64)
@@ -166,165 +154,19 @@ def load_csv_dataset(
     return features_tensor, labels_tensor, label_names, fitted_lda
 
 
-# ── Convenience wrappers per dataset ────────────────────────────────────
-
-def load_dfp(
-    csv_path: str = "C:/data/dataset/DFP/DFP0395_comprehensiveSft.csv",
-    feature_columns: list[str] | None = None,
-    min_samples_per_class: int = 2,
-    use_lda: bool = False,
-) -> tuple[torch.Tensor, torch.Tensor, list[str], LinearDiscriminantAnalysis | None]:
-    """Load DFP dataset. Treatment = drug1 column."""
-    if feature_columns is None:
-        feature_columns = discover_feature_columns(
-            csv_path,
-            "C:/data/dataset/CNS/CNS0091_comprehensiveSft.csv",
-        )
-    return load_csv_dataset(
-        csv_path=csv_path,
-        perturbation_col="drug1",
-        feature_columns=feature_columns,
-        min_samples_per_class=min_samples_per_class,
-        use_lda=use_lda,
-    )
-
-
-def load_dfp_with_dose(
-    csv_path: str = "C:/data/dataset/DFP/DFP0395_comprehensiveSft.csv",
-    feature_columns: list[str] | None = None,
-    min_samples_per_class: int = 2,
-    use_lda: bool = False,
-) -> dict:
-    """Load DFP with compound + dose labels for ordinal loss.
-
-    Returns dict with keys:
-        features, labels, label_names, lda_model,
-        compound_labels (int), compound_names (list),
-        dose_labels (int rank 0..N), dose_values (float conc)
-    """
-    if feature_columns is None:
-        feature_columns = discover_feature_columns(
-            csv_path,
-            "C:/data/dataset/CNS/CNS0091_comprehensiveSft.csv",
-        )
-
-    # Load raw CSV to get compound + dose columns alongside features
-    print(f"Loading {csv_path} (with dose info) ...")
-    df = pd.read_csv(csv_path)
-
-    # drug1 column has format "COMPOUND:BATCH"
-    df["_compound"] = df["drug1"].str.split(":").str[0]
-
-    # Filter + extract features via load_csv_dataset
-    features, labels, label_names, lda_model = load_csv_dataset(
-        csv_path=csv_path,
-        perturbation_col="drug1",
-        feature_columns=feature_columns,
-        min_samples_per_class=min_samples_per_class,
-        use_lda=use_lda,
-    )
-
-    # Reload to get the filtered rows aligned with features
-    # (load_csv_dataset drops NaN + rare classes, so re-filter df the same way)
-    treatments = df["drug1"].astype(str)
-    counts = Counter(treatments)
-    valid = {t for t, c in counts.items() if c >= min_samples_per_class}
-    df_filtered = df[treatments.isin(valid) & treatments.notna()].reset_index(drop=True)
-
-    # Compound labels
-    compounds = df_filtered["_compound"]
-    compound_names = sorted(compounds.unique())
-    compound_map = {name: idx for idx, name in enumerate(compound_names)}
-    compound_labels = torch.tensor(
-        compounds.map(compound_map).values, dtype=torch.int64
-    )
-
-    # Dose rank (per compound, rank concentrations 0..N)
-    dose_values = df_filtered["drug1Concentration"].values.astype(np.float32)
-    dose_ranks = np.zeros(len(df_filtered), dtype=np.int64)
-    for comp in compound_names:
-        comp_mask = compounds.values == comp
-        concs = np.sort(np.unique(dose_values[comp_mask]))
-        conc_to_rank = {c: i for i, c in enumerate(concs)}
-        for i in np.where(comp_mask)[0]:
-            dose_ranks[i] = conc_to_rank[dose_values[i]]
-
-    print(f"  {len(compound_names)} compounds, dose ranks 0..{dose_ranks.max()}")
-
-    return {
-        "features": features,
-        "labels": labels,
-        "label_names": label_names,
-        "lda_model": lda_model,
-        "compound_labels": compound_labels,
-        "compound_names": compound_names,
-        "dose_labels": torch.tensor(dose_ranks, dtype=torch.int64),
-        "dose_values": torch.tensor(dose_values, dtype=torch.float32),
-    }
-
-
-def load_cns(
-    csv_path: str = "C:/data/dataset/CNS/CNS0091_comprehensiveSft.csv",
-    metadata_csv: str = "C:/data/dataset/CNS/CNS0091_sourceMetadata.csv",
-    feature_columns: list[str] | None = None,
-    min_samples_per_class: int = 2,
-    use_lda: bool = False,
-) -> tuple[torch.Tensor, torch.Tensor, list[str], LinearDiscriminantAnalysis | None]:
-    """Load CNS dataset. Treatment from sourceMetadata join."""
-    if feature_columns is None:
-        feature_columns = discover_feature_columns(
-            "C:/data/dataset/DFP/DFP0395_comprehensiveSft.csv",
-            csv_path,
-        )
-    return load_csv_dataset(
-        csv_path=csv_path,
-        perturbation_col="treatment",
-        feature_columns=feature_columns,
-        metadata_csv=metadata_csv,
-        metadata_join_keys=["SourceNumber", "WellDescription"],
-        metadata_rename={"WellDescription_x": "WellDescription"},
-        min_samples_per_class=min_samples_per_class,
-        use_lda=use_lda,
-    )
-
-
 def load_joint(
-    dfp_csv: str = "C:/data/dataset/DFP/DFP0395_comprehensiveSft.csv",
-    cns_csv: str = "C:/data/dataset/CNS/CNS0091_comprehensiveSft.csv",
-    cns_metadata_csv: str = "C:/data/dataset/CNS/CNS0091_sourceMetadata.csv",
-    feature_columns: list[str] | None = None,
+    dfp_dir: str = "/data/dataset/DFP",
+    cns_dir: str = "/data/dataset/CNS",
+    n_bins: int = 825,
     min_samples_per_class: int = 2,
-    use_lda: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, list[str]]:
     """Load both DFP + CNS into a single dataset with shared label space."""
-    if feature_columns is None:
-        feature_columns = discover_feature_columns(dfp_csv, cns_csv)
-
-    feat_dfp, lab_dfp, names_dfp, _ = load_csv_dataset(
-        csv_path=dfp_csv,
-        perturbation_col="drug1",
-        feature_columns=feature_columns,
-        min_samples_per_class=min_samples_per_class,
-        use_lda=use_lda,
+    feat_dfp, lab_dfp, names_dfp, _ = load_mat_dataset(
+        dfp_dir, n_bins=n_bins, min_samples_per_class=min_samples_per_class,
     )
-    feat_cns, lab_cns, names_cns, _ = load_csv_dataset(
-        csv_path=cns_csv,
-        perturbation_col="treatment",
-        feature_columns=feature_columns,
-        metadata_csv=cns_metadata_csv,
-        metadata_join_keys=["SourceNumber", "WellDescription"],
-        metadata_rename={"WellDescription_x": "WellDescription"},
-        min_samples_per_class=min_samples_per_class,
-        use_lda=use_lda,
+    feat_cns, lab_cns, names_cns, _ = load_mat_dataset(
+        cns_dir, n_bins=n_bins, min_samples_per_class=min_samples_per_class,
     )
-
-    # For joint, both must have same feature dim
-    if feat_dfp.shape[1] != feat_cns.shape[1]:
-        raise ValueError(
-            f"Feature dim mismatch: DFP={feat_dfp.shape[1]}, CNS={feat_cns.shape[1]}. "
-            f"With LDA each dataset gets n_classes-1 dims. "
-            f"Use use_lda=False for joint, or pre-align dimensions."
-        )
 
     # Merge label spaces — offset CNS labels
     offset = len(names_dfp)
