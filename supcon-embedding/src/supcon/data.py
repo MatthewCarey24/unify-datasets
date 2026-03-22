@@ -149,6 +149,11 @@ def load_mat_dataset(
         lda = LinearDiscriminantAnalysis(solver="svd")
         features_np = lda.fit_transform(features_np, labels).astype(np.float32)
         fitted_lda = lda
+        # z-score LDA output — components have wildly different scales
+        lda_mean = features_np.mean(axis=0)
+        lda_std = features_np.std(axis=0)
+        lda_std[lda_std == 0] = 1.0
+        features_np = (features_np - lda_mean) / lda_std
         print(f"  LDA -> {features_np.shape[1]} dims "
               f"(variance ratio sum: {lda.explained_variance_ratio_.sum():.3f})")
 
