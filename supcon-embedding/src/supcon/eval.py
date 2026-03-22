@@ -11,7 +11,7 @@ import torch
 from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import roc_auc_score, silhouette_score
 
-from supcon.data import discover_feature_columns, load_cns, load_dfp
+from supcon.data import discover_feature_columns, load_cns, load_dfp, load_joint
 from supcon.model import ResidualMLP
 
 
@@ -104,30 +104,33 @@ def evaluate_joint(
     dfp_dir: str, cns_dir: str,
     feature_columns: list[str],
 ) -> dict:
+    """Evaluate joint model using shared z-score (same as training)."""
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = load_model_from_checkpoint(ckpt_joint, device)
 
-    print("Loading DFP...")
-    feat_dfp, lab_dfp, names_dfp, _ = load_dfp(dfp_dir, feature_columns)
-    print("Loading CNS...")
-    feat_cns, lab_cns, names_cns, _ = load_cns(cns_dir, feature_columns)
+    # Load with shared z-score — same as training
+    print("Loading joint data (shared z-score)...")
+    features, labels, label_names = load_joint(dfp_dir, cns_dir, feature_columns)
 
-    print("Embedding DFP...")
-    emb_dfp = embed(model, feat_dfp, device)
-    print("Embedding CNS...")
-    emb_cns = embed(model, feat_cns, device)
+    # Split back into DFP/CNS by label prefix
+    is_dfp = torch.tensor([label_names[l].startswith("DFP:") for l in labels.tolist()])
+    is_cns = ~is_dfp
+
+    print("Embedding all...")
+    all_emb = embed(model, features, device)
+    emb_dfp = all_emb[is_dfp.numpy()]
+    emb_cns = all_emb[is_cns.numpy()]
 
     leakage = compute_leakage_auroc(emb_dfp, emb_cns)
-    all_emb = np.concatenate([emb_dfp, emb_cns], axis=0)
-    all_labels = [names_dfp[l] for l in lab_dfp.tolist()] + [names_cns[l] for l in lab_cns.tolist()]
+    all_labels = [label_names[l] for l in labels.tolist()]
     sil = compute_silhouette(all_emb, all_labels)
 
     return {
         "condition": "joint",
         "leakage_auroc": round(leakage, 4),
         "separation_silhouette": round(sil, 4),
-        "n_dfp": len(emb_dfp),
-        "n_cns": len(emb_cns),
+        "n_dfp": int(is_dfp.sum()),
+        "n_cns": int(is_cns.sum()),
     }
 
 

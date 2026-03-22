@@ -63,16 +63,31 @@ def _find_csv(dataset_dir: str, pattern: str) -> str:
     return str(matches[0])
 
 
-def discover_feature_columns(dfp_csv: str, cns_csv: str) -> list[str]:
-    """Return sorted list of numeric feature columns shared by both CSVs."""
-    dfp_head = pd.read_csv(dfp_csv, nrows=50)
-    cns_head = pd.read_csv(cns_csv, nrows=50)
-    shared = set(dfp_head.columns) & set(cns_head.columns)
-    feature_cols = sorted([
+def discover_feature_columns(
+    dfp_csv: str, cns_csv: str, max_nan_rate: float = 0.5,
+) -> list[str]:
+    """Return sorted list of numeric feature columns shared by both CSVs.
+
+    Only keeps columns where NaN rate is below max_nan_rate in BOTH datasets.
+    This prevents NaN-pattern leakage between datasets.
+    """
+    dfp = pd.read_csv(dfp_csv)
+    cns = pd.read_csv(cns_csv)
+    shared = set(dfp.columns) & set(cns.columns)
+    candidates = sorted([
         c for c in shared
         if c not in METADATA_COLS
-        and dfp_head[c].dtype in ("float64", "float32", "int64", "int32")
+        and dfp[c].dtype in ("float64", "float32", "int64", "int32")
     ])
+    # Filter by NaN rate in both datasets
+    feature_cols = []
+    for c in candidates:
+        dfp_nan = dfp[c].isna().mean()
+        cns_nan = cns[c].isna().mean()
+        if dfp_nan <= max_nan_rate and cns_nan <= max_nan_rate:
+            feature_cols.append(c)
+    print(f"  Feature columns: {len(feature_cols)} / {len(candidates)} "
+          f"(filtered at {max_nan_rate:.0%} NaN threshold)")
     return feature_cols
 
 
@@ -230,24 +245,69 @@ def load_joint(
     feature_columns: list[str],
     min_samples_per_class: int = 2,
 ) -> tuple[torch.Tensor, torch.Tensor, list[str]]:
-    """Load both DFP + CNS into a single dataset with shared label space."""
-    feat_dfp, lab_dfp, names_dfp, _ = load_dfp(
-        dfp_dir, feature_columns, min_samples_per_class,
+    """Load both DFP + CNS into a single dataset with shared z-score and label space.
+
+    Critical: z-score is computed over the combined dataset so that
+    feature distributions are comparable and don't leak dataset identity.
+    """
+    # ── Load raw DataFrames ──
+    dfp_csv = _find_csv(dfp_dir, "*_comprehensiveSft.csv")
+    cns_csv = _find_csv(cns_dir, "*_comprehensiveSft.csv")
+    cns_meta = _find_csv(cns_dir, "*_sourceMetadata.csv")
+
+    print(f"Loading {dfp_csv} ...")
+    df_dfp = _preprocess_dfp(pd.read_csv(dfp_csv))
+    print(f"Loading {cns_csv} ...")
+    df_cns = pd.read_csv(cns_csv)
+
+    # Join CNS treatment
+    meta = pd.read_csv(cns_meta)
+    meta = meta.rename(columns={"WellDescription_x": "WellDescription"})
+    meta_subset = meta[["SourceNumber", "WellDescription", "treatment"]].drop_duplicates(
+        subset=["SourceNumber", "WellDescription"]
     )
-    feat_cns, lab_cns, names_cns, _ = load_cns(
-        cns_dir, feature_columns, min_samples_per_class,
-    )
+    df_cns = df_cns.merge(meta_subset, on=["SourceNumber", "WellDescription"], how="left")
 
-    offset = len(names_dfp)
-    lab_cns_offset = lab_cns + offset
-    all_names = names_dfp + names_cns
+    # ── Create unified treatment column ──
+    # DFP: compound_dose, CNS: treatment (prefixed to avoid collisions)
+    df_dfp["_joint_label"] = "DFP:" + df_dfp["_compound_dose"]
+    df_cns["_joint_label"] = "CNS:" + df_cns["treatment"].astype(str)
 
-    features = torch.cat([feat_dfp, feat_cns], dim=0)
-    labels = torch.cat([lab_dfp, lab_cns_offset], dim=0)
+    # ── Concatenate ──
+    df = pd.concat([df_dfp, df_cns], ignore_index=True)
+    df = df.dropna(subset=["_joint_label"])
+    treatments = df["_joint_label"].astype(str)
 
-    print(f"Joint: {len(features)} samples, {len(all_names)} classes "
-          f"({len(names_dfp)} DFP + {len(names_cns)} CNS)")
-    return features, labels, all_names
+    # Filter rare classes
+    counts = Counter(treatments)
+    valid = {t for t, c in counts.items() if c >= min_samples_per_class}
+    mask = treatments.isin(valid)
+    df = df[mask].reset_index(drop=True)
+    treatments = treatments[mask].reset_index(drop=True)
+
+    # ── Extract features ──
+    present_cols = [c for c in feature_columns if c in df.columns]
+    features_np = df[present_cols].astype(np.float32).fillna(0.0).values
+
+    # ── SHARED z-score across both datasets ──
+    mean = features_np.mean(axis=0)
+    std = features_np.std(axis=0)
+    std[std == 0] = 1.0
+    features_np = (features_np - mean) / std
+
+    # ── Encode labels ──
+    label_names = sorted(treatments.unique())
+    label_map = {name: idx for idx, name in enumerate(label_names)}
+    labels = treatments.map(label_map).values.astype(np.int64)
+
+    n_dfp = len(df_dfp)
+    n_cns = len(df_cns)
+    features_tensor = torch.tensor(features_np, dtype=torch.float32)
+    labels_tensor = torch.tensor(labels, dtype=torch.int64)
+
+    print(f"Joint: {len(features_tensor)} samples, {len(label_names)} classes, "
+          f"{features_tensor.shape[1]} features (shared z-score)")
+    return features_tensor, labels_tensor, label_names
 
 
 # ── DataLoader helpers ──────────────────────────────────────────────────
