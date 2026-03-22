@@ -46,6 +46,14 @@ METADATA_COLS = {
 }
 
 
+def _preprocess_dfp(df: pd.DataFrame) -> pd.DataFrame:
+    """Create compound_dose label: strip batch from drug1, combine with concentration."""
+    df = df.copy()
+    df["_compound"] = df["drug1"].str.split(":").str[0]
+    df["_compound_dose"] = df["_compound"] + "_" + df["drug1Concentration"].astype(str)
+    return df
+
+
 def _find_csv(dataset_dir: str, pattern: str) -> str:
     """Find a CSV matching a glob pattern."""
     p = Path(dataset_dir)
@@ -77,6 +85,8 @@ def load_sft_dataset(
     metadata_rename: dict[str, str] | None = None,
     min_samples_per_class: int = 2,
     use_lda: bool = False,
+    lda_col: str | None = None,
+    preprocess_fn: callable | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, list[str], LinearDiscriminantAnalysis | None]:
     """Load a comprehensiveSft CSV into (features, labels, label_names, lda).
 
@@ -89,12 +99,17 @@ def load_sft_dataset(
         metadata_rename: Rename dict applied to metadata before join.
         min_samples_per_class: Drop classes with fewer samples.
         use_lda: If True, apply SVD-LDA after z-score.
+        preprocess_fn: Optional function to preprocess the DataFrame before label extraction.
 
     Returns:
         features, labels, label_names, lda_model
     """
     print(f"Loading {csv_path} ...")
     df = pd.read_csv(csv_path)
+
+    # ── Optional preprocessing (e.g. create compound_dose label) ──
+    if preprocess_fn is not None:
+        df = preprocess_fn(df)
 
     # ── Join with sourceMetadata if treatment column is missing ──
     if perturbation_col not in df.columns and metadata_csv is not None:
@@ -134,11 +149,25 @@ def load_sft_dataset(
     label_map = {name: idx for idx, name in enumerate(label_names)}
     labels = treatments.map(label_map).values.astype(np.int64)
 
+    # ── Encode LDA labels (may use a coarser grouping) ──
+    lda_labels = None
+    if use_lda and lda_col is not None and lda_col in df.columns:
+        lda_treatments = df[lda_col].astype(str)
+        lda_names = sorted(lda_treatments.unique())
+        lda_map = {name: idx for idx, name in enumerate(lda_names)}
+        lda_labels = lda_treatments.map(lda_map).values.astype(np.int64)
+        print(f"  LDA grouping: {len(lda_names)} classes from '{lda_col}'")
+
     # ── Optional LDA ──
+    # lda_labels can differ from training labels (e.g. compound-only for DFP)
     fitted_lda = None
     if use_lda:
         lda = LinearDiscriminantAnalysis(solver="svd")
-        features_np = lda.fit_transform(features_np, labels).astype(np.float32)
+        if lda_labels is not None:
+            lda_fit_labels = lda_labels
+        else:
+            lda_fit_labels = labels
+        features_np = lda.fit_transform(features_np, lda_fit_labels).astype(np.float32)
         fitted_lda = lda
         lda_mean = features_np.mean(axis=0)
         lda_std = features_np.std(axis=0)
@@ -161,14 +190,16 @@ def load_dfp(
     min_samples_per_class: int = 2,
     use_lda: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, list[str], LinearDiscriminantAnalysis | None]:
-    """Load DFP dataset. Treatment = drug1 column."""
+    """Load DFP dataset. Treatment = compound_dose (drug1 stripped of batch + concentration)."""
     csv_path = _find_csv(dataset_dir, "*_comprehensiveSft.csv")
     return load_sft_dataset(
         csv_path=csv_path,
-        perturbation_col="drug1",
+        perturbation_col="_compound_dose",
         feature_columns=feature_columns,
         min_samples_per_class=min_samples_per_class,
         use_lda=use_lda,
+        lda_col="_compound",  # LDA uses compound-only (22 classes -> 21 dims)
+        preprocess_fn=_preprocess_dfp,
     )
 
 
