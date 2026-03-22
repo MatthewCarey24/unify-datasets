@@ -1,0 +1,24 @@
+# Condition D: Joint training — same raw features, trained together
+[data]
+mode = "joint"
+use_lda = false
+dfp_csv = "C:/data/dataset/DFP/DFP0395_comprehensiveSft.csv"
+cns_csv = "C:/data/dataset/CNS/CNS0091_comprehensiveSft.csv"
+cns_metadata_csv = "C:/data/dataset/CNS/CNS0091_sourceMetadata.csv"
+batch_size = 256
+
+[model]
+hidden_dims = [512, 256, 128]
+embed_dim = 128
+
+[loss]
+temperature = 0.07
+
+[optimizer]
+lr = 1e-3
+weight_decay = 1e-4
+max_steps = 5000
+
+[run]
+seed = 42
+output_dir = "outputs/D_joint"

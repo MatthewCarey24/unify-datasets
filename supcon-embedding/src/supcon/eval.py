@@ -1,0 +1,186 @@
+"""Evaluation: leakage AUROC + silhouette score on merged embeddings."""
+
+from __future__ import annotations
+
+import argparse
+import json
+from pathlib import Path
+
+import numpy as np
+import torch
+from sklearn.linear_model import LogisticRegression
+from sklearn.metrics import roc_auc_score, silhouette_score
+
+try:
+    import tomllib
+except ImportError:
+    import tomli as tomllib  # type: ignore[no-redef]
+
+from supcon.data import discover_feature_columns, load_cns, load_dfp
+from supcon.model import ResidualMLP
+
+
+def load_model_from_checkpoint(ckpt_path: str, device: torch.device) -> ResidualMLP:
+    """Load a ResidualMLP from a training checkpoint."""
+    ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
+    cfg = ckpt["config"]
+    model_cfg = cfg.get("model", {})
+    model = ResidualMLP(
+        input_dim=ckpt["input_dim"],
+        hidden_dims=model_cfg.get("hidden_dims", [512, 256, 128]),
+        embed_dim=model_cfg.get("embed_dim", 128),
+    )
+    model.load_state_dict(ckpt["model_state_dict"])
+    model = model.to(device)
+    model.eval()
+    return model
+
+
+@torch.no_grad()
+def embed(model: ResidualMLP, features: torch.Tensor, device: torch.device, batch_size: int = 1024) -> np.ndarray:
+    """Embed all samples, return [N, D] numpy array."""
+    all_embs = []
+    for i in range(0, len(features), batch_size):
+        batch = features[i : i + batch_size].to(device)
+        emb = model(batch)
+        all_embs.append(emb.cpu().numpy())
+    return np.concatenate(all_embs, axis=0)
+
+
+def compute_leakage_auroc(emb_a: np.ndarray, emb_b: np.ndarray) -> float:
+    """Logistic regression AUROC to classify dataset A vs B in embedding space."""
+    X = np.concatenate([emb_a, emb_b], axis=0)
+    y = np.array([0] * len(emb_a) + [1] * len(emb_b))
+    clf = LogisticRegression(max_iter=1000, solver="lbfgs")
+    clf.fit(X, y)
+    proba = clf.predict_proba(X)[:, 1]
+    return float(roc_auc_score(y, proba))
+
+
+def compute_silhouette(embeddings: np.ndarray, labels: list[str]) -> float:
+    """Silhouette score by treatment label."""
+    unique = sorted(set(labels))
+    if len(unique) < 2:
+        return 0.0
+    label_map = {name: i for i, name in enumerate(unique)}
+    int_labels = np.array([label_map[t] for t in labels])
+
+    # Subsample if too large (silhouette is O(n^2))
+    n = len(embeddings)
+    if n > 10000:
+        rng = np.random.default_rng(42)
+        idx = rng.choice(n, size=10000, replace=False)
+        embeddings = embeddings[idx]
+        int_labels = int_labels[idx]
+
+    return float(silhouette_score(embeddings, int_labels))
+
+
+def evaluate_separate(ckpt_dfp: str, ckpt_cns: str, dfp_lda: bool = False, cns_lda: bool = False) -> dict:
+    """Evaluate separate condition: two independently trained encoders."""
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    model_dfp = load_model_from_checkpoint(ckpt_dfp, device)
+    model_cns = load_model_from_checkpoint(ckpt_cns, device)
+
+    feature_columns = discover_feature_columns(
+        "C:/data/dataset/DFP/DFP0395_comprehensiveSft.csv",
+        "C:/data/dataset/CNS/CNS0091_comprehensiveSft.csv",
+    )
+
+    print("Loading DFP...")
+    feat_dfp, lab_dfp, names_dfp, _ = load_dfp(feature_columns=feature_columns, use_lda=dfp_lda)
+    print("Loading CNS...")
+    feat_cns, lab_cns, names_cns, _ = load_cns(feature_columns=feature_columns, use_lda=cns_lda)
+
+    print("Embedding DFP...")
+    emb_dfp = embed(model_dfp, feat_dfp, device)
+    print("Embedding CNS...")
+    emb_cns = embed(model_cns, feat_cns, device)
+
+    leakage = compute_leakage_auroc(emb_dfp, emb_cns)
+
+    all_emb = np.concatenate([emb_dfp, emb_cns], axis=0)
+    all_labels = [names_dfp[l] for l in lab_dfp.tolist()] + [names_cns[l] for l in lab_cns.tolist()]
+    sil = compute_silhouette(all_emb, all_labels)
+
+    return {
+        "condition": "separate",
+        "leakage_auroc": round(leakage, 4),
+        "separation_silhouette": round(sil, 4),
+        "n_dfp": len(emb_dfp),
+        "n_cns": len(emb_cns),
+    }
+
+
+def evaluate_joint(ckpt_joint: str) -> dict:
+    """Evaluate joint condition: single encoder for both datasets."""
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    model = load_model_from_checkpoint(ckpt_joint, device)
+
+    feature_columns = discover_feature_columns(
+        "C:/data/dataset/DFP/DFP0395_comprehensiveSft.csv",
+        "C:/data/dataset/CNS/CNS0091_comprehensiveSft.csv",
+    )
+
+    print("Loading DFP...")
+    feat_dfp, lab_dfp, names_dfp, _ = load_dfp(feature_columns=feature_columns)
+    print("Loading CNS...")
+    feat_cns, lab_cns, names_cns, _ = load_cns(feature_columns=feature_columns)
+
+    print("Embedding DFP...")
+    emb_dfp = embed(model, feat_dfp, device)
+    print("Embedding CNS...")
+    emb_cns = embed(model, feat_cns, device)
+
+    leakage = compute_leakage_auroc(emb_dfp, emb_cns)
+
+    all_emb = np.concatenate([emb_dfp, emb_cns], axis=0)
+    all_labels = [names_dfp[l] for l in lab_dfp.tolist()] + [names_cns[l] for l in lab_cns.tolist()]
+    sil = compute_silhouette(all_emb, all_labels)
+
+    return {
+        "condition": "joint",
+        "leakage_auroc": round(leakage, 4),
+        "separation_silhouette": round(sil, 4),
+        "n_dfp": len(emb_dfp),
+        "n_cns": len(emb_cns),
+    }
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Evaluate SupCon embeddings")
+    sub = parser.add_subparsers(dest="mode", required=True)
+
+    sep = sub.add_parser("separate", help="Evaluate separately trained encoders")
+    sep.add_argument("--ckpt-dfp", required=True)
+    sep.add_argument("--ckpt-cns", required=True)
+    sep.add_argument("--dfp-lda", action="store_true", help="Apply LDA to DFP features")
+    sep.add_argument("--cns-lda", action="store_true", help="Apply LDA to CNS features")
+    sep.add_argument("-o", "--output", default=None)
+
+    jnt = sub.add_parser("joint", help="Evaluate jointly trained encoder")
+    jnt.add_argument("--ckpt", required=True)
+    jnt.add_argument("-o", "--output", default=None)
+
+    args = parser.parse_args()
+
+    if args.mode == "separate":
+        result = evaluate_separate(
+            args.ckpt_dfp, args.ckpt_cns,
+            dfp_lda=args.dfp_lda, cns_lda=args.cns_lda,
+        )
+    else:
+        result = evaluate_joint(args.ckpt)
+
+    print(json.dumps(result, indent=2))
+
+    if args.output:
+        Path(args.output).parent.mkdir(parents=True, exist_ok=True)
+        Path(args.output).write_text(json.dumps(result, indent=2))
+        print(f"Saved -> {args.output}")
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,27 @@
+# Condition A: Replicate Paul's CNS — no LDA, SupCon (temp=0.3)
+[data]
+mode = "cns"
+use_lda = false
+dfp_csv = "C:/data/dataset/DFP/DFP0395_comprehensiveSft.csv"
+cns_csv = "C:/data/dataset/CNS/CNS0091_comprehensiveSft.csv"
+cns_metadata_csv = "C:/data/dataset/CNS/CNS0091_sourceMetadata.csv"
+batch_size = 256
+
+[model]
+hidden_dims = [512, 256, 128]
+embed_dim = 128
+
+[loss]
+type = "paul_cns"
+temperature = 0.30
+w_supcon = 1.0
+w_align = 0.5
+
+[optimizer]
+lr = 1e-3
+weight_decay = 1e-4
+max_steps = 5000
+
+[run]
+seed = 42
+output_dir = "outputs/A_cns_nolda"
