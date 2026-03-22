@@ -121,7 +121,7 @@ def train(cfg: dict) -> Path:
             scheduler.step()
             step += 1
 
-            if step % 100 == 0 or step == 1:
+            if step % 500 == 0 or step <= 5:
                 cur_lr = scheduler.get_last_lr()[0]
                 print(f"  step {step:>5d}/{max_steps}  loss={loss.item():.4f}  lr={cur_lr:.2e}")
 
